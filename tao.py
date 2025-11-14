@@ -1,9 +1,13 @@
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.tree import DecisionTreeClassifier
-import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin # make basic sklearn classifier functions available through inheritance
+from sklearn.preprocessing import StandardScaler # standard scale features to allow for convergence in logistic regression
+from sklearn.tree import DecisionTreeClassifier # base decision tree classifier
+from sklearn.linear_model import LogisticRegression # logistic regression for oblique splits
+import numpy as np 
 
 from sklearn import tree
 import matplotlib.pyplot as plt
+
+from joblib import Parallel, delayed
 
 class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def __init__(self, max_depth=5, min_samples_leaf=5, random_state=None,
@@ -13,22 +17,30 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
         self.type = type
         self.max_passes = max_passes
-
+    
     def fit(self, X, y):
-        self.X = X
-        self.y = y
+        self.scaler_ = StandardScaler()
+        self.X_ = self.scaler_.fit_transform(X)
+        self.y_ = y
         base = DecisionTreeClassifier(
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state
         )
 
-        base.fit(self.X, self.y)
+        base.fit(self.X_, self.y_)
         self.base_tree_ = base
         self.tree_ = self.base_tree_.tree_
-        self.care_set_indices = self.base_tree_.decision_path(self.X)
-        self._compute_depths()
         
+        node_indicator = self.base_tree_.decision_path(self.X_).tocsc()
+        self.care_sets_ = [
+            node_indicator[:, j].indices  # row indices of non-zero entries
+            for j in range(node_indicator.shape[1])
+        ]
+        self._compute_depths()
+        self.weights_ = np.zeros((self.base_tree_.tree_.node_count, X.shape[1]))  # placeholder
+        self.biases_ = np.zeros(self.base_tree_.tree_.node_count)      # placeholder
+
         for _ in range(self.max_passes):
             self.optimize()
             self.reroute()
@@ -73,20 +85,44 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         Optimizes the tree by optimizing each internal node. 
         Nodes at the same depth are independent and can be optimized in parallel.
         """
-        print(self.node_depth_)
+        for depth in reversed(range(self.max_depth)):
+            node_ids_at_depth = np.where(self.node_depth_ == depth)[0]
+            results = Parallel(n_jobs=-1)(
+                delayed(self._compute_oblique_params_for_node)(node_id)
+                for node_id in node_ids_at_depth
+            )
                 
+            for node_id, params in results:
+                if self.type == "oblique":
+                    self._apply_oblique_params(node_id, params)
+
+                """
+                else:
+                    self._apply_axis_aligned_params(node_id, params)
+                """
     
     def reroute(self):
         """ Reroute samples through the optimized tree structure """
         pass
 
-    def optimize_oblique_node(self, node_id):
-        """ Optimize an oblique split at the given node """
-        pass
+    def _compute_oblique_params_for_node(self, node_id):
+        """
+        Compute the oblique parameters (w, b) for the given node, without modifying the tree to prevent race conditions
+        """
 
-    def optimize_axis_aligned_node(self, node_id):
-        """ Optimize an axis-aligned split at the given node """
-        pass
+        X_node = self.X_[self.care_sets_[node_id]]
+        y_node = self.y_[self.care_sets_[node_id]]
+
+        logreg = LogisticRegression().fit(X_node, y_node)
+        w, b = logreg.coef_, logreg.intercept_
+
+        return node_id, (w, b)
+
+    def _apply_oblique_params(self, node_id, params):
+        w, b = params
+        # store them somewhere:
+        self.weights_[node_id] = w
+        self.biases_[node_id] = b
 
     def prune_tree(self):
         """Prune the tree to remove dead or pure branches"""
