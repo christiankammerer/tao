@@ -9,15 +9,29 @@ import matplotlib.pyplot as plt
 
 from joblib import Parallel, delayed
 
+
+def get_depth_batch(node_depths: np.ndarray, reroute_every: int):
+    """
+    Yield batches of unique depth values (processed deepest first).
+    """
+    if reroute_every < 1:
+        raise ValueError("reroute_every must be >= 1")
+
+    unique_depths = np.unique(node_depths)
+    sorted_depths = np.sort(unique_depths)[::-1]
+    for start in range(0, len(sorted_depths), reroute_every):
+        yield sorted_depths[start:start + reroute_every]
+
 class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def __init__(self, max_depth=5, min_samples_leaf=5, random_state=None,
-                 type = "oblique", max_passes=5, C=1):
+                 type = "oblique", max_passes=5, C=1, reroute_every: int = 1):
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
         self.random_state = random_state
         self.type = type
         self.max_passes = max_passes
         self.C = C
+        self.reroute_every = reroute_every
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         # Scale data and set up initial tree
@@ -49,10 +63,10 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.traverser_ = TreeTraversal(self.tree_, self.weights_, self.biases_, self.oblique_active_)
 
         for pass_num in range(self.max_passes):
-            for depth in reversed(range(self.max_depth)):
-                self._optimize_depth(depth)
-                if depth > 0:
-                    self.reroute()  # update node sets after each depth optimization
+            for depth_batch in get_depth_batch(self.node_depth_, self.reroute_every):
+                self._optimize_depth(depth_batch)
+                if np.any(depth_batch > 0):
+                    self.reroute()  # update node sets after each depth optimization batch
         self.prune_tree()
 
     def _compute_depths(self):
@@ -91,14 +105,21 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         class_indices = np.argmax(self.tree_.value[leaf_ids, 0, :], axis=1) # majority voting in leaves
         return self.model_.classes_[class_indices]
 
-    def _optimize_depth(self, depth: int) -> None:
+    def _optimize_depth(self, depths) -> None:
         """
-        Optimize all nodes at a specific depth in parallel
+        Optimize all nodes at one or multiple depth levels in parallel
         
         Args:
-            depth: Depth level to optimize
+            depths: Single depth value or iterable of depth values to optimize
         """
-        node_ids_at_depth = np.where(self.node_depth_ == depth)[0]
+        depth_array = np.atleast_1d(depths).astype(int)
+        print(f"Optimizing depth batch: {depth_array.tolist()}")
+        node_mask = np.isin(self.node_depth_, depth_array)
+        node_ids_at_depth = np.where(node_mask)[0]
+
+        if node_ids_at_depth.size == 0:
+            return
+
         results = Parallel(n_jobs=-1)(
             delayed(self._compute_oblique_params_for_node)(node_id)
             for node_id in node_ids_at_depth
