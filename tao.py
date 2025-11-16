@@ -20,6 +20,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.C = C
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        # Scale data and set up initial tree
         self.scaler_ = StandardScaler()
         self.X_ = self.scaler_.fit_transform(X)
         self.y_ = y
@@ -29,11 +30,9 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             random_state=self.random_state
         )
 
-
-
         self.model_.fit(self.X_, self.y_)
-        self.tree_ = self.model_.tree_ # will be mani
-        self._compute_depths()
+        self.tree_ = self.model_.tree_ 
+        self._compute_depths() # compute depth of every node
         
 
         # Compute which samples reach which nodes
@@ -49,10 +48,11 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.weights_, self.biases_, self.oblique_active_ = np.zeros((n_nodes, self.X_.shape[1])), np.zeros(n_nodes), np.zeros(n_nodes, dtype=bool)
         self.traverser_ = TreeTraversal(self.tree_, self.weights_, self.biases_, self.oblique_active_)
 
-        for _ in range(self.max_passes):
-            print(_)
-            self.optimize()
-            self.reroute()
+        for pass_num in range(self.max_passes):
+            for depth in reversed(range(self.max_depth)):
+                self._optimize_depth(depth)
+                if depth > 0:
+                    self.reroute()  # update node sets after each depth optimization
         self.prune_tree()
 
     def _compute_depths(self):
@@ -91,22 +91,21 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         class_indices = np.argmax(self.tree_.value[leaf_ids, 0, :], axis=1) # majority voting in leaves
         return self.model_.classes_[class_indices]
 
-    def optimize(self):
+    def _optimize_depth(self, depth: int) -> None:
         """
-        Optimizes the tree by optimizing each internal node. 
-        Nodes at the same depth are independent and can be optimized in parallel.
+        Optimize all nodes at a specific depth in parallel
+        
+        Args:
+            depth: Depth level to optimize
         """
-        for depth in reversed(range(self.max_depth)):
-            node_ids_at_depth = np.where(self.node_depth_ == depth)[0]
-                
-            results = Parallel(n_jobs=-1)(
-                delayed(self._compute_oblique_params_for_node)(node_id)
-                for node_id in node_ids_at_depth
-            )
-                
-            for node_id, params in results:
-                if params is not None:  # Only apply if we computed parameters
-                    self._apply_oblique_params(node_id, params)
+        node_ids_at_depth = np.where(self.node_depth_ == depth)[0]
+        results = Parallel(n_jobs=-1)(
+            delayed(self._compute_oblique_params_for_node)(node_id)
+            for node_id in node_ids_at_depth
+        )
+        for node_id, params in results:
+            if params is not None:
+                self._apply_oblique_params(node_id, params)
 
 
     def _compute_care_set(self, node_id: int, node_set: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -154,8 +153,70 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         return care_indices, targets
 
     def reroute(self):
-        """ Reroute samples through the optimized tree structure """
-        pass    
+        """
+        Update node_sets based on current oblique splits.
+        This is essential for alternating optimization to work correctly.
+        """
+        self.node_sets_ = self._compute_node_sets_vectorized()
+
+    def _compute_node_sets_vectorized(self):
+        """
+        Efficiently compute node_sets using vectorized traversal.
+        
+        The key insight: We can track all samples simultaneously and determine
+        their node membership as they traverse.
+        """
+        n_samples = self.X_.shape[0]
+        n_nodes = self.tree_.node_count
+        
+        # For each sample, track which node it's currently at
+        current_nodes = np.zeros(n_samples, dtype=np.int32)  # All start at root (0)
+        
+        # Track which nodes each sample has visited
+        node_visits = [[] for _ in range(n_nodes)]
+        for sample_idx in range(n_samples):
+            node_visits[0].append(sample_idx)  # All samples visit root
+        
+        children_left = self.tree_.children_left
+        
+        # Traverse level by level
+        active_mask = np.ones(n_samples, dtype=bool)
+        
+        while np.any(active_mask):
+            current_node_ids = current_nodes[active_mask]
+            node_is_leaf = children_left[current_node_ids] == -1
+            
+            # Filter to only internal nodes
+            internal_mask = ~node_is_leaf
+            internal_indices = np.where(active_mask)[0][internal_mask]
+            
+            if len(internal_indices) == 0:
+                break
+            
+            # Get samples and their current nodes
+            samples_at_internal = internal_indices
+            nodes_at_internal = current_nodes[samples_at_internal]
+            X_samples = self.X_[samples_at_internal]
+            
+            # Compute split decisions
+            go_left = self.traverser_.vectorized_split_decision(
+                X_samples, nodes_at_internal
+            )
+            
+            # Move samples to next nodes
+            left_children = children_left[nodes_at_internal]
+            right_children = self.tree_.children_right[nodes_at_internal]
+            next_nodes = np.where(go_left, left_children, right_children)
+            current_nodes[samples_at_internal] = next_nodes
+            
+            # Record node visits
+            for local_idx, go_l in enumerate(go_left):
+                sample_idx = samples_at_internal[local_idx]
+                next_node = next_nodes[local_idx]
+                node_visits[next_node].append(sample_idx)
+        
+        # Convert to numpy arrays
+        return [np.array(ns, dtype=int) for ns in node_visits]
 
     def _compute_oblique_params_for_node(self, node_id: int) -> Tuple[int, Tuple[np.ndarray, np.ndarray]]:
         """
@@ -173,7 +234,10 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
 
         if len(care_indices) < 2:  # Need at least 2 samples for logistic regression
             return node_id, None  # Return None to indicate no optimization needed
-    
+        unique_classes = np.unique(targets)
+
+        if len(unique_classes) < 2: # All targets are the same, no need to optimize
+            return node_id, None  
         X_node = self.X_[care_indices]
         
         # Apply logreg on care set
