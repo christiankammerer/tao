@@ -45,6 +45,9 @@ jobs:
           python scripts/benchmark.py --output metrics.json --max-depth 5 --passes 5
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         with:
           name: benchmark-metrics
           path: metrics.json
