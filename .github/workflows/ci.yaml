@@ -1,4 +1,3 @@
-# .github/workflows/ci.yml
 name: tests-and-benchmarks
 
 on:
@@ -22,7 +21,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run tests
-        working-directory: ${{ github.workspace }}
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: pytest
@@ -41,13 +39,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run benchmarks
-        run: |
-          python scripts/benchmark.py --output metrics.json --max-depth 5 --passes 5
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        working-directory: ${{ github.workspace }}
         env:
           PYTHONPATH: ${{ github.workspace }}
+        run: python scripts/benchmark.py --output metrics.json --max-depth 5 --passes 5
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
         with:
           name: benchmark-metrics
           path: metrics.json
