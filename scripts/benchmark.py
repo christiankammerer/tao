@@ -37,6 +37,7 @@ def main():
         "n_train": len(X_train),
         "n_test": len(X_test),
         "classes": int(np.unique(y).size),
+        "njobs": 1
     }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
