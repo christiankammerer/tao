@@ -19,7 +19,7 @@ def main():
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    clf = TAOTreeClassifier(max_depth=args.max_depth, max_passes=args.passes, random_state=42)
+    clf = TAOTreeClassifier(max_depth=args.max_depth, max_passes=args.passes, random_state=42, njobs=1)
 
     t0 = time.perf_counter()
     clf.fit(X_train, y_train)
@@ -37,7 +37,6 @@ def main():
         "n_train": len(X_train),
         "n_test": len(X_test),
         "classes": int(np.unique(y).size),
-        "njobs": 1
     }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
