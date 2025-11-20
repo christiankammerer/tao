@@ -11,7 +11,8 @@ from joblib import Parallel, delayed
 
 class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def __init__(self, max_depth=5, min_samples_leaf=5, random_state=None,
-                 type = "oblique", max_passes=5, C=1, reroute_every: int = 1, njobs: int = -1):
+                 type = "oblique", max_passes=5, C=1, reroute_every: int = 1, njobs: int = -1,
+                 change_threshold=0.01, selective_reroute=True):
         if reroute_every < 1:
             raise ValueError("reroute_every must be >= 1")
         if type not in ["oblique", "axis-aligned"]:
@@ -24,6 +25,8 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.C = C
         self.reroute_every = reroute_every
         self.njobs = njobs
+        self.change_threshold = change_threshold
+        self.selective_reroute = selective_reroute
     
     def _init_base_tree(self, X, y):
         """
@@ -48,7 +51,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         Initialize parameters for alternating optimization.
         """
         self._compute_depths() # compute depth of every node
-        # Compute which samples reach which nodes
+        # Compute which samples reach which nodes from the initial tree
         node_indicator = self.model_.decision_path(self.X_).tocsc()
         self.node_sets_ = [
             node_indicator[:, j].indices  # row indices of non-zero entries
@@ -66,9 +69,9 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def _optimize_tree(self):
         for pass_num in range(self.max_passes):
             for depth_batch in self.get_depth_batch(self.node_depth_, self.reroute_every):
-                self._optimize_depth(depth_batch)
-                if np.any(depth_batch > 0):
-                    self.reroute()
+                changed_nodes = self._optimize_depth(depth_batch)
+                if changed_nodes and np.any(depth_batch > 0):
+                    self.reroute(changed_nodes)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """
@@ -139,12 +142,15 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         class_indices = np.argmax(self.tree_.value[leaf_ids, 0, :], axis=1) # majority voting in leaves
         return self.model_.classes_[class_indices]
 
-    def _optimize_depth(self, depths: list) -> None:
+    def _optimize_depth(self, depths: list) -> List[int]:
         """
         Optimize all nodes at one or multiple depth levels in parallel
         
         Args:
             depths: Single depth value or iterable of depth values to optimize
+            
+        Returns:
+            List of node IDs that had significant parameter changes
         """
 
         # Extract all nodes at the given depth(s)
@@ -153,18 +159,29 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         node_ids_at_depth = np.where(node_mask)[0]
 
         if node_ids_at_depth.size == 0:
-            return
+            return []
 
-        # Optimize each node in parallel
+        # Store old parameters for change detection
+        old_params = {}
+        for node_id in node_ids_at_depth:
+            old_params[node_id] = (self.weights_[node_id].copy(), self.biases_[node_id])
+
+        # Optimize each node in parallel (does not provide significant speed-up in most cases due to overhead)
         results = Parallel(n_jobs=self.njobs)(
             delayed(self._compute_oblique_params_for_node)(node_id)
             for node_id in node_ids_at_depth
         )
 
-        # Apply the computed oblique parameters, after all optimizations are done to avoid race conditions
+        # Apply the computed oblique parameters and track significant changes
+        changed_nodes = []
         for node_id, params in results:
             if params is not None:
-                self._apply_oblique_params(node_id, params)
+                # Check if parameters changed significantly
+                if self._params_changed_significantly(old_params[node_id], params, node_id):
+                    self._apply_oblique_params(node_id, params)
+                    changed_nodes.append(node_id)
+        
+        return changed_nodes
 
     def _compute_care_set(self, node_id: int, node_set: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -178,6 +195,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             care_indices: Indices of samples in the care set
             targets: Targets for the care set samples (0 for left, 1 for right)
         """
+        # If leaf node, no care set
         if self.tree_.children_left[node_id] == -1:
             return np.array([], dtype=int), np.array([], dtype=int)
 
@@ -192,22 +210,136 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             self.model_.classes_
         )
 
-        # Compute losses and identify care set
+        # Compute losses for both subtrees (0-1 loss)
         losses_l = (labels_l != y_true).astype(int)
         losses_r = (labels_r != y_true).astype(int)
+
+        # Care set: samples where left and right losses differ
         care_mask = losses_l != losses_r               
         
+        # Care-indice = index of care sample, target = which subtree has lower loss
         care_indices = node_set[care_mask]            
         targets = np.where(losses_l[care_mask] < losses_r[care_mask], 0, 1)
         return care_indices, targets
 
-    def reroute(self):
+    def reroute(self, changed_nodes=None):
         """
         Update node_sets based on current oblique splits.
+        
+        Args:
+            changed_nodes: List of node IDs that changed parameters. If None, performs full rerouting.
         """
-        self.node_sets_ = self.traverser_.compute_all_node_sets(self.X_)
-
-
+        if not self.selective_reroute or changed_nodes is None or len(changed_nodes) == 0:
+            # Full rerouting - recompute all node assignments
+            self.node_sets_ = self.traverser_.compute_all_node_sets(self.X_)
+        else:
+            # Selective rerouting - only update affected samples
+            affected_samples = self._get_affected_samples(changed_nodes)
+            if len(affected_samples) > 0:
+                self._selective_reroute(affected_samples)
+    
+    def _params_changed_significantly(self, old_params, new_params, node_id):
+        """
+        Check if oblique parameters changed significantly enough to warrant rerouting.
+        Uses relative change thresholds for both weights and bias to determine significance.
+        
+        Args:
+            old_params: Tuple of (old_weights, old_bias)
+            new_params: Tuple of (new_weights, new_bias)
+            node_id: ID of the node being checked
+            
+        Returns:
+            bool: True if parameters changed significantly
+        """
+        old_w, old_b = old_params
+        new_w, new_b = new_params
+        
+        # Handle edge case: first time setting oblique parameters
+        if np.allclose(old_w, 0) and abs(old_b) < 1e-8:
+            return True  # Always significant when going from axis-aligned to oblique
+        
+        # Relative change for weights
+        w_norm_old = np.linalg.norm(old_w)
+        w_norm_diff = np.linalg.norm(new_w.flatten() - old_w)
+        w_rel_change = w_norm_diff / (w_norm_old + 1e-8)
+        
+        # Relative change for bias
+        b_rel_change = abs(new_b[0] - old_b) / (abs(old_b) + 1e-8)
+        
+        # Consider significant if either weight or bias changed substantially
+        return w_rel_change > self.change_threshold or b_rel_change > self.change_threshold
+    
+    def _selective_reroute(self, affected_samples):
+        """
+        Selective rerouting for samples affected by oblique parameter changes.
+        Recomputes paths only for affected samples and updates node_sets accordingly.
+        
+        Args:
+            affected_samples: Array of sample indices that need rerouting
+        """
+        if len(affected_samples) == 0:
+            return
+        
+        # Remove affected samples from all node sets
+        for node_id in range(len(self.node_sets_)):
+            old_samples = self.node_sets_[node_id]
+            self.node_sets_[node_id] = old_samples[~np.isin(old_samples, affected_samples)]
+        
+        # Recompute paths for affected samples
+        X_affected = self.X_[affected_samples]
+        new_node_assignments = self.traverser_.compute_node_sets_for_samples(X_affected, affected_samples)
+        
+        # Update node_sets with new assignments
+        for node_id, new_samples in new_node_assignments.items():
+            if len(new_samples) > 0:
+                self.node_sets_[node_id] = np.concatenate([self.node_sets_[node_id], new_samples])
+    
+    def _get_affected_samples(self, changed_nodes):
+        """Find samples that would route differently due to changed nodes."""
+        affected_samples = []
+        
+        for node_id in changed_nodes:
+            # Get samples that reach this node
+            samples_at_node = self.node_sets_[node_id]
+            
+            if len(samples_at_node) == 0:
+                continue
+            
+            # Check which samples would route differently
+            routing_changes = self._check_routing_changes_vectorized(samples_at_node, node_id)
+            changed_samples = samples_at_node[routing_changes]
+            affected_samples.extend(changed_samples)
+        
+        return np.unique(affected_samples) if affected_samples else np.array([], dtype=int)
+    
+    def _check_routing_changes_vectorized(self, sample_indices, node_id):
+        """
+        Check which samples would route differently after oblique parameter changes.
+        Compares original axis-aligned decisions with new oblique decisions.
+        
+        Args:
+            sample_indices: Array of sample indices to check
+            node_id: ID of the node with changed parameters
+            
+        Returns:
+            Boolean mask indicating which samples changed routing decisions
+        """
+        if not self.oblique_active_[node_id] or self.tree_.children_left[node_id] == -1:
+            return np.zeros(len(sample_indices), dtype=bool)
+        
+        X_samples = self.X_[sample_indices]
+        
+        # Original axis-aligned decisions (vectorized)
+        feature = self.tree_.feature[node_id]
+        threshold = self.tree_.threshold[node_id]
+        original_goes_left = X_samples[:, feature] <= threshold
+        
+        # New oblique decisions (vectorized)
+        oblique_scores = X_samples @ self.weights_[node_id] + self.biases_[node_id]
+        oblique_goes_left = oblique_scores <= 0.0
+        
+        # Return mask where decisions differ
+        return original_goes_left != oblique_goes_left
 
     def _compute_oblique_params_for_node(self, node_id: int) -> Tuple[int, Tuple[np.ndarray, np.ndarray]]:
         """
@@ -248,6 +380,8 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def prune_tree(self):
         """Prune the tree to remove dead or pure branches"""
         pass
+    
+
 
 class TreeTraversal:
     """
@@ -536,3 +670,59 @@ class TreeTraversal:
         labels_r = self.batch_predict_from_leaves(leaves_r, classes)
         
         return labels_l, labels_r
+    
+    def compute_node_sets_for_samples(self, X_batch: np.ndarray, sample_indices: np.ndarray) -> dict:
+        """Compute which nodes the given samples visit and return as dictionary."""
+        n_samples = len(X_batch)
+        current_nodes = np.zeros(n_samples, dtype=np.int32)
+        active_mask = np.ones(n_samples, dtype=bool)
+        
+        # Dictionary to track which samples visit each node
+        node_visits = {}
+        
+        # All samples start at root
+        if 0 not in node_visits:
+            node_visits[0] = []
+        node_visits[0].extend(sample_indices)
+        
+        while np.any(active_mask):
+            active_indices = np.where(active_mask)[0]
+            if len(active_indices) == 0:
+                break
+            
+            current_node_ids = current_nodes[active_indices]
+            is_leaf = self.tree_.children_left[current_node_ids] == -1
+            
+            # Samples at leaves are done
+            active_mask[active_indices[is_leaf]] = False
+            
+            # Continue with samples at internal nodes
+            internal_mask = ~is_leaf
+            if not np.any(internal_mask):
+                break
+            
+            internal_indices = active_indices[internal_mask]
+            X_internal = X_batch[internal_indices]
+            node_ids_internal = current_node_ids[internal_mask]
+            
+            # Compute next nodes using current parameters
+            go_left = self.vectorized_split_decision(X_internal, node_ids_internal)
+            left_children = self.tree_.children_left[node_ids_internal]
+            right_children = self.tree_.children_right[node_ids_internal]
+            next_nodes = np.where(go_left, left_children, right_children)
+            
+            # Update positions and record visits
+            for i, internal_idx in enumerate(internal_indices):
+                next_node = next_nodes[i]
+                current_nodes[internal_idx] = next_node
+                
+                # Record visit
+                if next_node not in node_visits:
+                    node_visits[next_node] = []
+                node_visits[next_node].append(sample_indices[internal_idx])
+        
+        # Convert lists to numpy arrays
+        for node_id in node_visits:
+            node_visits[node_id] = np.array(node_visits[node_id], dtype=int)
+            
+        return node_visits
