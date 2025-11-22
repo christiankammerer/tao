@@ -11,8 +11,23 @@ from joblib import Parallel, delayed
 
 class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def __init__(self, max_depth=5, min_samples_leaf=5, random_state=None,
-                 type = "oblique", max_passes=5, C=1, reroute_every: int = 1, njobs: int = -1,
+                 type = "oblique", max_passes=5, C=1, reroute_every: int = 1, njobs: int = 1, niter = 100,
                  change_threshold=0.01, selective_reroute=True):
+        """
+        Initialize TAO Tree Classifier.
+        Args:
+            max_depth: Maximum depth of the tree (as trained by initial decision tree)
+            min_samples_leaf: Minimum samples required to be at a leaf node
+            random_state: Random seed for reproducibility
+            type: Type of splits to use ("oblique" or "axis-aligned") # axis aligned not yet implemented
+            max_passes: Maximum number of alternating optimization passes
+            C: Inverse regularization strength for logistic regression
+            reroute_every: Number of depth levels to optimize before rerouting data (increases training speed)
+            njobs: Number of parallel jobs to use for optimizing nodes at the same depth (parallelism overhead may outweigh benefits)
+            niter: Number of iterations for logistic regression solver (some logreg solvers may not converge well with few iterations)
+            change_threshold: Relative change threshold to determine if rerouting is needed
+            selective_reroute: Whether to selectively reroute only changed nodes or all nodes at a depth    
+        """
         if reroute_every < 1:
             raise ValueError("reroute_every must be >= 1")
         if type not in ["oblique", "axis-aligned"]:
@@ -25,6 +40,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.C = C
         self.reroute_every = reroute_every
         self.njobs = njobs
+        self.niter = niter
         self.change_threshold = change_threshold
         self.selective_reroute = selective_reroute
     
@@ -40,7 +56,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state
         )
-        self.scaler_ = StandardScaler()
+        self.scaler_ = StandardScaler() # Scale data for better convergence
         self.X_ = self.scaler_.fit_transform(X)
         self.y_ = y
         self.model_.fit(self.X_, self.y_)
@@ -64,7 +80,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.weights_, self.biases_, self.oblique_active_ = np.zeros((n_nodes, self.X_.shape[1])), np.zeros(n_nodes), np.zeros(n_nodes, dtype=bool)
         self.traverser_: TreeTraversal = TreeTraversal(self.tree_, self.weights_, self.biases_, self.oblique_active_)
         
-
+        # Cache static tree structure for reuse
 
     def _optimize_tree(self):
         for pass_num in range(self.max_passes):
@@ -86,8 +102,6 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.__init_params()
         # Perform alternating optimization
         self._optimize_tree()
-        # Prune tree to remove dead or pure branches
-        self.prune_tree()
 
     def _compute_depths(self):
         """
@@ -161,7 +175,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         if node_ids_at_depth.size == 0:
             return []
 
-        # Store old parameters for change detection
+        # Store old parameters to check for significant changes
         old_params = {}
         for node_id in node_ids_at_depth:
             old_params[node_id] = (self.weights_[node_id].copy(), self.biases_[node_id])
@@ -292,10 +306,20 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         # Update node_sets with new assignments
         for node_id, new_samples in new_node_assignments.items():
             if len(new_samples) > 0:
-                self.node_sets_[node_id] = np.concatenate([self.node_sets_[node_id], new_samples])
+                if len(self.node_sets_[node_id]) == 0:
+                    # Direct assignment for empty arrays (faster than concatenation)
+                    self.node_sets_[node_id] = new_samples
+                else:
+                    # Concatenate when both arrays have elements
+                    self.node_sets_[node_id] = np.concatenate([self.node_sets_[node_id], new_samples])
     
-    def _get_affected_samples(self, changed_nodes):
-        """Find samples that would route differently due to changed nodes."""
+    def _get_affected_samples(self, changed_nodes: List[int]) -> np.ndarray:
+        """Find samples that would route differently due to changed nodes.
+        Args:
+            changed_nodes: List of node IDs that have significantly changed oblique parameters
+        Returns:
+            np.ndarray: Array of sample indices that would route differently
+        """
         affected_samples = []
         
         for node_id in changed_nodes:
@@ -364,22 +388,21 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         X_node = self.X_[care_indices]
         
         # Apply logreg on care set
-        logreg = LogisticRegression(C=self.C).fit(X_node, targets)
+        logreg = LogisticRegression(C=self.C).fit(X_node, targets, self.niter)
         w, b = logreg.coef_, logreg.intercept_
         return node_id, (w, b)
 
     def _apply_oblique_params(self, node_id: int, params: Tuple[np.ndarray, np.ndarray]) -> None:
-        """Apply the oblique parameters (w, b) to the given node"""
+        """Apply the oblique parameters (w, b) to the given node
+        
+        Args:
+            node_id: ID of the node to update
+            params: Tuple of (weight vector, bias term)
+        """
         w, b = params
         self.weights_[node_id] = w
         self.biases_[node_id] = b[0]
-        self.oblique_active_[node_id] = True 
-
-
-
-    def prune_tree(self):
-        """Prune the tree to remove dead or pure branches"""
-        pass
+        self.oblique_active_[node_id] = True
     
 
 
@@ -630,8 +653,6 @@ class TreeTraversal:
         features = self.tree_.feature[node_ids]
         thresholds = self.tree_.threshold[node_ids]
         return X_batch[np.arange(len(node_ids)), features] <= thresholds
-    
-
     
     def batch_predict_from_leaves(self, leaf_ids: np.ndarray, classes: np.ndarray) -> np.ndarray:
         """
