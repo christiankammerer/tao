@@ -403,6 +403,108 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.weights_[node_id] = w
         self.biases_[node_id] = b[0]
         self.oblique_active_[node_id] = True
+
+    def prune_tree(self):
+        """
+        Prune dead and pure branches from the tree by marking nodes as inactive.
+        """
+        if not hasattr(self, 'node_sets_') or not hasattr(self, 'y_'):
+            return
+        
+        # Build parent map for traversal
+        parent_map = self._build_parent_map()
+        
+        # Find all nodes to remove
+        nodes_to_remove = set()
+        
+        # Process leaves first, then work up
+        current_leaves = self._get_leaf_nodes()
+        
+        # Find dead nodes and their branches
+        for leaf in current_leaves:
+            if self._is_dead(leaf):
+                nodes_to_remove.update(self._traverse_up_dead(leaf, parent_map))
+        
+        # Find pure nodes and their branches (except the highest pure node)
+        for leaf in current_leaves:
+            if leaf not in nodes_to_remove and self._is_pure(leaf):
+                nodes_to_remove.update(self._traverse_up_pure(leaf, parent_map))
+        
+        if nodes_to_remove:
+            self._mark_nodes_inactive(nodes_to_remove)
+    
+    def _is_dead(self, node_id: int) -> bool:
+        """Check if node is dead (no samples reach it)."""
+        return len(self.node_sets_[node_id]) == 0
+    
+    def _is_pure(self, node_id: int) -> bool:
+        """Check if node is pure (all samples have same class)."""
+        node_samples = self.node_sets_[node_id]
+        if len(node_samples) == 0:
+            return False
+        first_label = self.y_[node_samples[0]]
+        return np.all(self.y_[node_samples] == first_label)
+    
+
+    
+    def _traverse_up_dead(self, start_node: int, parent_map: dict) -> set:
+        """Traverse up from dead node and collect all consecutive dead ancestors."""
+        to_remove = set()
+        current = start_node
+        
+        while current is not None and self._is_dead(current):
+            to_remove.add(current)
+            current = parent_map.get(current)
+        
+        return to_remove
+    
+    def _traverse_up_pure(self, start_node: int, parent_map: dict) -> set:
+        """
+        Traverse up from pure node and mark for removal up to (not including) highest pure ancestor.
+        """
+        to_remove = set()
+        current = start_node
+        last_pure = None
+        
+        # Find the highest pure ancestor
+        while current is not None and self._is_pure(current):
+            last_pure = current
+            current = parent_map.get(current)
+        
+        # Remove everything except the highest pure node
+        current = start_node
+        while current is not None and current != last_pure and self._is_pure(current):
+            to_remove.add(current)
+            current = parent_map.get(current)
+        
+        return to_remove
+    
+    def _build_parent_map(self):
+        """Build mapping from child node ID to parent node ID."""
+        parent_map = {}
+        for node_id in range(self.tree_.node_count):
+            left = self.tree_.children_left[node_id]
+            right = self.tree_.children_right[node_id]
+            if left != -1:
+                parent_map[left] = node_id
+            if right != -1:
+                parent_map[right] = node_id
+        return parent_map
+    
+    def _get_leaf_nodes(self):
+        """Get all current leaf node IDs."""
+        return [i for i in range(self.tree_.node_count) 
+                if self.tree_.children_left[i] == -1]
+    
+    def _mark_nodes_inactive(self, nodes_to_remove: set):
+        """
+        Mark nodes as inactive by clearing their data, but keep all arrays the same size.
+        """
+        for node_id in nodes_to_remove:
+            self.node_sets_[node_id] = np.array([], dtype=int)
+            self.weights_[node_id] = 0.0
+            self.biases_[node_id] = 0.0
+            self.oblique_active_[node_id] = False
     
 
 
