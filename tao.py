@@ -4,7 +4,6 @@ from sklearn.tree import DecisionTreeClassifier # base decision tree classifier
 from sklearn.linear_model import LogisticRegression # logistic regression for oblique splits
 import numpy as np 
 from typing import Tuple, Optional, List
-from sklearn import tree
 import matplotlib.pyplot as plt
 
 from joblib import Parallel, delayed
@@ -44,6 +43,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.change_threshold = change_threshold
         self.selective_reroute = selective_reroute
     
+    # The two methods below initialize the base decision tree and extract its structure
     def _init_base_tree(self, X, y):
         """
         Initialize the base decision tree classifier.
@@ -51,7 +51,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             X: (n_samples, n_features) array of input samples
             y: (n_samples,) array of class labels
         """
-        self.model_ = DecisionTreeClassifier(
+        sklearn_model = DecisionTreeClassifier(
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state
@@ -59,58 +59,63 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.scaler_ = StandardScaler() # Scale data for better convergence
         self.X_ = self.scaler_.fit_transform(X)
         self.y_ = y
-        self.model_.fit(self.X_, self.y_)
-        self.tree_ = self.model_.tree_ 
+        
+        # Pass sample weights to sklearn tree if provided
+        if self.sample_weight_ is not None:
+            sklearn_model.fit(self.X_, self.y_, sample_weight=self.sample_weight_)
+        else:
+            sklearn_model.fit(self.X_, self.y_)
+        
+        # Extract tree structure (sklearn model no longer needed after this)
+        self._extract_tree_structure(sklearn_model) 
 
-    def __init_params(self):
+    def _extract_tree_structure(self, sklearn_model):
+        """Extract essential attributes from sklearn tree for independent operation."""
+        tree = sklearn_model.tree_
+        
+        # Core tree structure
+        self.node_count_ = tree.node_count
+        self.children_left_ = tree.children_left.copy()
+        self.children_right_ = tree.children_right.copy()
+        self.features_ = tree.feature.copy()
+        self.thresholds_ = tree.threshold.copy()
+        self.values_ = tree.value.copy()
+        
+        # Class information
+        self.classes_ = sklearn_model.classes_.copy()
+        
+        # Build node sets using sklearn's decision_path (only time we need sklearn functionality)
+        node_indicator = sklearn_model.decision_path(self.X_).tocsc()
+        self.node_sets_ = [
+            node_indicator[:, j].indices
+            for j in range(node_indicator.shape[1])
+        ]
+    
+    # The two methods below initialize parameters and structures for the main algorithm
+    def _init_params(self):
         """
         Initialize parameters for alternating optimization.
         """
         self._compute_depths() # compute depth of every node
-        # Compute which samples reach which nodes from the initial tree
-        node_indicator = self.model_.decision_path(self.X_).tocsc()
-        self.node_sets_ = [
-            node_indicator[:, j].indices  # row indices of non-zero entries
-            for j in range(node_indicator.shape[1])
-        ]
         
-        n_nodes = self.tree_.node_count
+        n_nodes = self.node_count_
 
         # Will later store oblique weights, biases and indicator variable if node is oblique or still axis-aligned
         self.weights_, self.biases_, self.oblique_active_ = np.zeros((n_nodes, self.X_.shape[1])), np.zeros(n_nodes), np.zeros(n_nodes, dtype=bool)
-        self.traverser_: TreeTraversal = TreeTraversal(self.tree_, self.weights_, self.biases_, self.oblique_active_)
-        
-        # Cache static tree structure for reuse
-
-    def _optimize_tree(self):
-        for pass_num in range(self.max_passes):
-            for depth_batch in self.get_depth_batch(self.node_depth_, self.reroute_every):
-                changed_nodes = self._optimize_depth(depth_batch)
-                if changed_nodes and np.any(depth_batch > 0):
-                    self.reroute(changed_nodes)
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
-        """
-        Fits initial decision tree and optimizes oblique splits using alternating optimization.
-        Args:
-            X: (n_samples, n_features) array of input samples
-            y: (n_samples,) array of class labels
-        """
-        # Initialize base decision tree
-        self._init_base_tree(X, y)
-        # Initialize parameters for alternating optimization
-        self.__init_params()
-        # Perform alternating optimization
-        self._optimize_tree()
+        self.traverser_: TreeTraversal = TreeTraversal(
+            self.node_count_, self.children_left_, self.children_right_, 
+            self.features_, self.thresholds_, self.values_, self.classes_,
+            self.weights_, self.biases_, self.oblique_active_
+        )
 
     def _compute_depths(self):
         """
         Computes depth of each node in the tree.
         Only used once during set-up
         """
-        n_nodes = self.tree_.node_count
-        children_left = self.tree_.children_left
-        children_right = self.tree_.children_right
+        n_nodes = self.node_count_
+        children_left = self.children_left_
+        children_right = self.children_right_
 
         depth = np.zeros(n_nodes, dtype=int)
         stack = [(0, 0)]  # (node_id, depth), root is 0
@@ -126,6 +131,47 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
 
         self.node_depth_ = depth
 
+    # Main execution methods: fit and predict
+    def fit(self, X: np.ndarray, y: np.ndarray, sample_weight=None) -> None:
+        """
+        Fits initial decision tree and optimizes oblique splits using alternating optimization.
+        Args:
+            X: (n_samples, n_features) array of input samples
+            y: (n_samples,) array of class labels
+            sample_weight: (n_samples,) array of sample weights (optional, for boosting)
+        """
+        # Store sample weights for use in tree building
+        self.sample_weight_ = sample_weight
+        
+        # Initialize base decision tree and extract structure
+        self._init_base_tree(X, y)
+        # Initialize parameters for alternating optimization
+        self._init_params()
+        # Perform alternating optimization
+        self._optimize_tree()
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predict class labels for samples in X.
+        Args:
+            X: (n_samples, n_features) array of input samples
+        Returns:
+            predictions: (n_samples,) array of predicted class labels
+        """
+        X_scaled = self.scaler_.transform(X) # scale features
+        leaf_ids = self.traverser_.batch_descend_from(X_scaled, 0) # traverse to leaves
+        class_indices = np.argmax(self.values_[leaf_ids, 0, :], axis=1) # majority voting in leaves
+        return self.classes_[class_indices]
+    
+    def _optimize_tree(self):
+        for pass_num in range(self.max_passes):
+            for depth_batch in self.get_depth_batch(self.node_depth_, self.reroute_every):
+                changed_nodes = self._optimize_depth(depth_batch)
+                if changed_nodes and np.any(depth_batch > 0):
+                    self.reroute(changed_nodes)
+
+
+    # The two methods below handle depth batching and optimization at a given depth
     def get_depth_batch(self, node_depths: np.ndarray, reroute_every: int):
         """
         Yield batches of unique depth values (processes deepest first).
@@ -142,19 +188,6 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         sorted_depths = np.sort(unique_depths)[::-1]
         for start in range(0, len(sorted_depths), reroute_every):
             yield sorted_depths[start:start + reroute_every]
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Predict class labels for samples in X.
-        Args:
-            X: (n_samples, n_features) array of input samples
-        Returns:
-            predictions: (n_samples,) array of predicted class labels
-        """
-        X_scaled = self.scaler_.transform(X) # scale features
-        leaf_ids = self.traverser_.batch_descend_from(X_scaled, 0) # traverse to leaves
-        class_indices = np.argmax(self.tree_.value[leaf_ids, 0, :], axis=1) # majority voting in leaves
-        return self.model_.classes_[class_indices]
 
     def _optimize_depth(self, depths: list) -> List[int]:
         """
@@ -210,7 +243,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             targets: Targets for the care set samples (0 for left, 1 for right)
         """
         # If leaf node, no care set
-        if self.tree_.children_left[node_id] == -1:
+        if self.children_left_[node_id] == -1:
             return np.array([], dtype=int), np.array([], dtype=int)
 
         y_true = self.y_[node_set]
@@ -219,9 +252,9 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         # Use TreeTraversal's batch prediction for both subtrees
         labels_l, labels_r = self.traverser_.batch_predict_subtrees(
             X_node, 
-            self.tree_.children_left[node_id],
-            self.tree_.children_right[node_id], 
-            self.model_.classes_
+            self.children_left_[node_id],
+            self.children_right_[node_id], 
+            self.classes_
         )
 
         # Compute losses for both subtrees (0-1 loss)
@@ -236,6 +269,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         targets = np.where(losses_l[care_mask] < losses_r[care_mask], 0, 1)
         return care_indices, targets
 
+    # The five methods below handle re-routing of samples, either fully or selectively
     def reroute(self, changed_nodes=None):
         """
         Update node_sets based on current oblique splits.
@@ -348,14 +382,14 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         Returns:
             Boolean mask indicating which samples changed routing decisions
         """
-        if not self.oblique_active_[node_id] or self.tree_.children_left[node_id] == -1:
+        if not self.oblique_active_[node_id] or self.children_left_[node_id] == -1:
             return np.zeros(len(sample_indices), dtype=bool)
         
         X_samples = self.X_[sample_indices]
         
         # Original axis-aligned decisions (vectorized)
-        feature = self.tree_.feature[node_id]
-        threshold = self.tree_.threshold[node_id]
+        feature = self.features_[node_id]
+        threshold = self.thresholds_[node_id]
         original_goes_left = X_samples[:, feature] <= threshold
         
         # New oblique decisions (vectorized)
@@ -364,7 +398,8 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         
         # Return mask where decisions differ
         return original_goes_left != oblique_goes_left
-
+    
+    # The two methods below handle oblique parameter computation and application
     def _compute_oblique_params_for_node(self, node_id: int) -> Tuple[int, Tuple[np.ndarray, np.ndarray]]:
         """
         Compute the oblique parameters (w, b) for the given node, without modifying the tree to prevent race conditions
@@ -387,8 +422,22 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             return node_id, None  
         X_node = self.X_[care_indices]
         
-        # Apply logreg on care set
-        logreg = LogisticRegression(C=self.C).fit(X_node, targets, self.niter)
+        # Get sample weights for the care set if they exist
+        if hasattr(self, 'sample_weight_') and self.sample_weight_ is not None:
+            weights_node = self.sample_weight_[care_indices]
+            # Renormalize weights to sum to len(care_indices) to maintain proper scale
+            # AdaBoost normalizes weights to sum to 1 over entire dataset, but LogisticRegression
+            # expects weights scaled to the subset size for proper regularization
+            weight_sum = weights_node.sum()
+            if weight_sum > 0:
+                weights_node = weights_node * (len(care_indices) / weight_sum)
+                logreg = LogisticRegression(C=self.C, max_iter=self.niter).fit(X_node, targets, sample_weight=weights_node)
+            else:
+                # If all weights are 0, treat as unweighted
+                logreg = LogisticRegression(C=self.C, max_iter=self.niter).fit(X_node, targets)
+        else:
+            logreg = LogisticRegression(C=self.C, max_iter=self.niter).fit(X_node, targets)
+        
         w, b = logreg.coef_, logreg.intercept_
         return node_id, (w, b)
 
@@ -406,106 +455,238 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
 
     def prune_tree(self):
         """
-        Prune dead and pure branches from the tree by marking nodes as inactive.
+        Prune the tree by removing dead branches, pure subtrees, and pass-through nodes.
+        This delegates to the TreePruner class for the actual pruning logic.
         """
-        if not hasattr(self, 'node_sets_') or not hasattr(self, 'y_'):
+        pruner = TreePruner(self)
+        pruner.prune()
+    
+    def _update_traverser(self):
+        """
+        Update the TreeTraversal object with current tree structure.
+        """
+        self.traverser_ = TreeTraversal(
+            self.node_count_, self.children_left_, self.children_right_, 
+            self.features_, self.thresholds_, self.values_, self.classes_,
+            self.weights_, self.biases_, self.oblique_active_
+        )
+
+
+class TreePruner:
+    """
+    Class for pruning decision trees by removing dead branches, pure subtrees,
+    and handling pass-through nodes.
+    """
+    
+    def __init__(self, tree_classifier):
+        """
+        Initialize pruner with reference to the tree classifier.
+        
+        Parameters
+        ----------
+        tree_classifier : TAOTreeClassifier
+            The tree classifier to prune
+        """
+        self.tree = tree_classifier
+    
+    def prune(self):
+        """
+        Physically prune dead branches, pure subtrees, and pass-through nodes.
+        Reduces memory usage by actually removing redundant nodes.
+        """
+        if not hasattr(self.tree, 'node_sets_') or not hasattr(self.tree, 'y_'):
             return
         
-        # Build parent map for traversal
-        parent_map = self._build_parent_map()
+        # Step 1: Identify nodes to remove
+        nodes_to_remove = self._identify_nodes_to_remove()
         
-        # Find all nodes to remove
+        if not nodes_to_remove:
+            return
+        
+        # Step 2: Handle promotions before removal
+        self._handle_promotions(nodes_to_remove)
+        
+        # Step 3: Physically reconstruct tree without removed nodes
+        self._reconstruct_tree(nodes_to_remove)
+        
+        # Step 4: Update traverser with new structure
+        self.tree._update_traverser()
+    
+    def _identify_nodes_to_remove(self) -> set:
+        """Identify all nodes that need to be removed: dead branches and pure subtrees."""
         nodes_to_remove = set()
         
-        # Process leaves first, then work up
-        current_leaves = self._get_leaf_nodes()
+        # Find dead branches (entire dead subtrees)
+        for node_id in range(self.tree.node_count_):
+            if len(self.tree.node_sets_[node_id]) == 0 and self.tree.children_left_[node_id] == -1:
+                # Dead leaf - traverse up to find entire dead branch
+                nodes_to_remove.update(self._find_dead_branch(node_id))
         
-        # Find dead nodes and their branches
-        for leaf in current_leaves:
-            if self._is_dead(leaf):
-                nodes_to_remove.update(self._traverse_up_dead(leaf, parent_map))
+        # Find pure subtrees (keep only highest pure ancestor)
+        for node_id in range(self.tree.node_count_):
+            if (node_id not in nodes_to_remove and 
+                self._is_pure(node_id) and 
+                self.tree.children_left_[node_id] == -1):
+                # Pure leaf - find pure subtree to remove
+                nodes_to_remove.update(self._find_pure_subtree(node_id))
         
-        # Find pure nodes and their branches (except the highest pure node)
-        for leaf in current_leaves:
-            if leaf not in nodes_to_remove and self._is_pure(leaf):
-                nodes_to_remove.update(self._traverse_up_pure(leaf, parent_map))
-        
-        if nodes_to_remove:
-            self._mark_nodes_inactive(nodes_to_remove)
-    
-    def _is_dead(self, node_id: int) -> bool:
-        """Check if node is dead (no samples reach it)."""
-        return len(self.node_sets_[node_id]) == 0
+        return nodes_to_remove
     
     def _is_pure(self, node_id: int) -> bool:
         """Check if node is pure (all samples have same class)."""
-        node_samples = self.node_sets_[node_id]
-        if len(node_samples) == 0:
-            return False
-        first_label = self.y_[node_samples[0]]
-        return np.all(self.y_[node_samples] == first_label)
+        samples = self.tree.node_sets_[node_id]
+        return len(samples) > 0 and len(np.unique(self.tree.y_[samples])) == 1
     
-
+    def _find_dead_branch(self, dead_leaf: int) -> set:
+        """Find entire dead branch starting from dead leaf."""
+        dead_nodes = set()
+        current = dead_leaf
+        
+        # Traverse up while nodes are dead
+        while current is not None and len(self.tree.node_sets_[current]) == 0:
+            dead_nodes.add(current)
+            current = self._find_parent(current)
+        
+        return dead_nodes
     
-    def _traverse_up_dead(self, start_node: int, parent_map: dict) -> set:
-        """Traverse up from dead node and collect all consecutive dead ancestors."""
-        to_remove = set()
-        current = start_node
+    def _find_pure_subtree(self, pure_leaf: int) -> set:
+        """Find pure subtree, keeping highest pure ancestor."""
+        # Find highest pure ancestor
+        current = pure_leaf
+        highest_pure = pure_leaf
         
-        while current is not None and self._is_dead(current):
-            to_remove.add(current)
-            current = parent_map.get(current)
-        
-        return to_remove
-    
-    def _traverse_up_pure(self, start_node: int, parent_map: dict) -> set:
-        """
-        Traverse up from pure node and mark for removal up to (not including) highest pure ancestor.
-        """
-        to_remove = set()
-        current = start_node
-        last_pure = None
-        
-        # Find the highest pure ancestor
         while current is not None and self._is_pure(current):
-            last_pure = current
-            current = parent_map.get(current)
+            highest_pure = current
+            current = self._find_parent(current)
         
-        # Remove everything except the highest pure node
-        current = start_node
-        while current is not None and current != last_pure and self._is_pure(current):
-            to_remove.add(current)
-            current = parent_map.get(current)
+        # Remove all descendants of highest pure node
+        to_remove = set()
+        self._collect_descendants(highest_pure, to_remove)
+        
+        # Convert highest pure to leaf with correct pure class values
+        if to_remove:
+            self.tree.children_left_[highest_pure] = -1
+            self.tree.children_right_[highest_pure] = -1
+            # Set correct pure class prediction
+            samples = self.tree.node_sets_[highest_pure]
+            if len(samples) > 0:
+                pure_class = self.tree.y_[samples[0]]
+                self.tree.values_[highest_pure] = np.zeros((1, len(self.tree.classes_)))
+                self.tree.values_[highest_pure][0, pure_class] = 1.0
         
         return to_remove
     
-    def _build_parent_map(self):
-        """Build mapping from child node ID to parent node ID."""
-        parent_map = {}
-        for node_id in range(self.tree_.node_count):
-            left = self.tree_.children_left[node_id]
-            right = self.tree_.children_right[node_id]
-            if left != -1:
-                parent_map[left] = node_id
-            if right != -1:
-                parent_map[right] = node_id
-        return parent_map
+    def _find_parent(self, node_id: int):
+        """Find parent of given node."""
+        for i in range(self.tree.node_count_):
+            if self.tree.children_left_[i] == node_id or self.tree.children_right_[i] == node_id:
+                return i
+        return None
     
-    def _get_leaf_nodes(self):
-        """Get all current leaf node IDs."""
-        return [i for i in range(self.tree_.node_count) 
-                if self.tree_.children_left[i] == -1]
+    def _collect_descendants(self, node_id: int, descendants: set):
+        """Recursively collect all descendants of a node."""
+        left = self.tree.children_left_[node_id]
+        right = self.tree.children_right_[node_id]
+        
+        if left != -1:
+            descendants.add(left)
+            self._collect_descendants(left, descendants)
+        
+        if right != -1:
+            descendants.add(right)
+            self._collect_descendants(right, descendants)
     
-    def _mark_nodes_inactive(self, nodes_to_remove: set):
-        """
-        Mark nodes as inactive by clearing their data, but keep all arrays the same size.
-        """
-        for node_id in nodes_to_remove:
-            self.node_sets_[node_id] = np.array([], dtype=int)
-            self.weights_[node_id] = 0.0
-            self.biases_[node_id] = 0.0
-            self.oblique_active_[node_id] = False
+    def _handle_promotions(self, nodes_to_remove: set):
+        """Handle pass-through nodes by promoting surviving children."""
+        # Find pass-through nodes (nodes with exactly one child being removed)
+        promoted_nodes = set()  # Track nodes that get promoted to avoid double promotion
+        
+        for node_id in range(self.tree.node_count_):
+            if node_id in nodes_to_remove:
+                continue
+                
+            left = self.tree.children_left_[node_id]
+            right = self.tree.children_right_[node_id]
+            
+            left_removed = left in nodes_to_remove
+            right_removed = right in nodes_to_remove
+            
+            # Pass-through: exactly one child removed
+            if left_removed and not right_removed and right != -1:
+                self._promote_subtree(node_id, right)
+                promoted_nodes.add(right)  # Mark child as promoted
+            elif right_removed and not left_removed and left != -1:
+                self._promote_subtree(node_id, left)
+                promoted_nodes.add(left)  # Mark child as promoted
+        
+        # Add promoted nodes to removal set (they've been copied to their parents)
+        nodes_to_remove.update(promoted_nodes)
     
+    def _promote_subtree(self, parent_id: int, child_id: int):
+        """Promote entire subtree: copy all data from child to parent."""
+        # Copy tree structure
+        self.tree.children_left_[parent_id] = self.tree.children_left_[child_id]
+        self.tree.children_right_[parent_id] = self.tree.children_right_[child_id]
+        self.tree.features_[parent_id] = self.tree.features_[child_id]
+        self.tree.thresholds_[parent_id] = self.tree.thresholds_[child_id]
+        self.tree.values_[parent_id] = self.tree.values_[child_id].copy()
+        
+        # Copy oblique parameters
+        if hasattr(self.tree, 'weights_'):
+            self.tree.weights_[parent_id] = self.tree.weights_[child_id].copy()
+            self.tree.biases_[parent_id] = self.tree.biases_[child_id]
+            self.tree.oblique_active_[parent_id] = self.tree.oblique_active_[child_id]
+        
+        # Copy node sets
+        self.tree.node_sets_[parent_id] = self.tree.node_sets_[child_id].copy()
+    
+    def _reconstruct_tree(self, nodes_to_remove: set):
+        """Physically reconstruct tree arrays without removed nodes."""
+        # Create mapping from old indices to new indices
+        active_nodes = [i for i in range(self.tree.node_count_) if i not in nodes_to_remove]
+        old_to_new = {old_id: new_id for new_id, old_id in enumerate(active_nodes)}
+        new_count = len(active_nodes)
+        
+        # Create new arrays with reduced size
+        new_children_left = np.full(new_count, -1, dtype=np.int32)
+        new_children_right = np.full(new_count, -1, dtype=np.int32)
+        new_features = np.zeros(new_count, dtype=np.int32)
+        new_thresholds = np.zeros(new_count, dtype=np.float64)
+        new_values = np.zeros((new_count, 1, len(self.tree.classes_)), dtype=np.float64)
+        new_weights = np.zeros((new_count, self.tree.X_.shape[1]), dtype=np.float64)
+        new_biases = np.zeros(new_count, dtype=np.float64)
+        new_oblique_active = np.zeros(new_count, dtype=bool)
+        new_node_sets = [None] * new_count
+        
+        # Copy data for active nodes and remap indices
+        for new_id, old_id in enumerate(active_nodes):
+            # Copy node data
+            new_features[new_id] = self.tree.features_[old_id]
+            new_thresholds[new_id] = self.tree.thresholds_[old_id]
+            new_values[new_id] = self.tree.values_[old_id].copy()
+            new_weights[new_id] = self.tree.weights_[old_id].copy()
+            new_biases[new_id] = self.tree.biases_[old_id]
+            new_oblique_active[new_id] = self.tree.oblique_active_[old_id]
+            new_node_sets[new_id] = self.tree.node_sets_[old_id].copy()
+            
+            # Remap children indices
+            left = self.tree.children_left_[old_id]
+            right = self.tree.children_right_[old_id]
+            
+            new_children_left[new_id] = old_to_new[left] if left in old_to_new else -1
+            new_children_right[new_id] = old_to_new[right] if right in old_to_new else -1
+        
+        # Replace all tree arrays
+        self.tree.node_count_ = new_count
+        self.tree.children_left_ = new_children_left
+        self.tree.children_right_ = new_children_right
+        self.tree.features_ = new_features
+        self.tree.thresholds_ = new_thresholds
+        self.tree.values_ = new_values
+        self.tree.weights_ = new_weights
+        self.tree.biases_ = new_biases
+        self.tree.oblique_active_ = new_oblique_active
+        self.tree.node_sets_ = new_node_sets
 
 
 class TreeTraversal:
@@ -513,8 +694,16 @@ class TreeTraversal:
     Class for traversing a decision tree with oblique and axis-aligned splits.
     """
 
-    def __init__(self, tree_: tree, weights: np.ndarray, biases: np.ndarray, oblique_active: np.ndarray) -> None:
-        self.tree_ = tree_
+    def __init__(self, node_count: int, children_left: np.ndarray, children_right: np.ndarray, 
+                 features: np.ndarray, thresholds: np.ndarray, values: np.ndarray, classes: np.ndarray,
+                 weights: np.ndarray, biases: np.ndarray, oblique_active: np.ndarray) -> None:
+        self.node_count_ = node_count
+        self.children_left_ = children_left
+        self.children_right_ = children_right
+        self.features_ = features
+        self.thresholds_ = thresholds
+        self.values_ = values
+        self.classes_ = classes
         self.weights_ = weights
         self.biases_ = biases
         self.oblique_active_ = oblique_active
@@ -585,7 +774,7 @@ class TreeTraversal:
         n_samples = X.shape[0]
         current_nodes = np.zeros(n_samples, dtype=np.int32)
         active_mask = np.ones(n_samples, dtype=bool)
-        node_visits = [[] for _ in range(self.tree_.node_count)]
+        node_visits = [[] for _ in range(self.node_count_)]
         for idx in range(n_samples):
             node_visits[0].append(idx)
         return current_nodes, active_mask, node_visits
@@ -675,7 +864,7 @@ class TreeTraversal:
         Returns:
             Boolean array indicating which nodes are leaves
         """
-        return self.tree_.children_left[node_ids] == -1
+        return self.children_left_[node_ids] == -1
     
     def _compute_next_nodes(self, X_samples: np.ndarray, current_node_ids: np.ndarray) -> np.ndarray:
         """
@@ -689,8 +878,8 @@ class TreeTraversal:
             Next node IDs for samples
         """
         go_left = self.vectorized_split_decision(X_samples, current_node_ids) # get pathing decision
-        left_children = self.tree_.children_left[current_node_ids]
-        right_children = self.tree_.children_right[current_node_ids]
+        left_children = self.children_left_[current_node_ids]
+        right_children = self.children_right_[current_node_ids]
         return np.where(go_left, left_children, right_children)
 
     def vectorized_split_decision(self, X_batch: np.ndarray, node_ids: np.ndarray) -> np.ndarray:
@@ -752,8 +941,8 @@ class TreeTraversal:
         Returns:
             Boolean array indicating go_left decisions
         """
-        features = self.tree_.feature[node_ids]
-        thresholds = self.tree_.threshold[node_ids]
+        features = self.features_[node_ids]
+        thresholds = self.thresholds_[node_ids]
         return X_batch[np.arange(len(node_ids)), features] <= thresholds
     
     def batch_predict_from_leaves(self, leaf_ids: np.ndarray, classes: np.ndarray) -> np.ndarray:
@@ -768,7 +957,7 @@ class TreeTraversal:
         Returns:
             Array of predicted class labels
         """
-        class_indices = np.argmax(self.tree_.value[leaf_ids, 0, :], axis=1)
+        class_indices = np.argmax(self.values_[leaf_ids, 0, :], axis=1)
         return classes[class_indices]
     
     def batch_predict_subtrees(self, X_batch: np.ndarray, left_root: int, 
@@ -814,7 +1003,7 @@ class TreeTraversal:
                 break
             
             current_node_ids = current_nodes[active_indices]
-            is_leaf = self.tree_.children_left[current_node_ids] == -1
+            is_leaf = self.children_left_[current_node_ids] == -1
             
             # Samples at leaves are done
             active_mask[active_indices[is_leaf]] = False
@@ -830,8 +1019,8 @@ class TreeTraversal:
             
             # Compute next nodes using current parameters
             go_left = self.vectorized_split_decision(X_internal, node_ids_internal)
-            left_children = self.tree_.children_left[node_ids_internal]
-            right_children = self.tree_.children_right[node_ids_internal]
+            left_children = self.children_left_[node_ids_internal]
+            right_children = self.children_right_[node_ids_internal]
             next_nodes = np.where(go_left, left_children, right_children)
             
             # Update positions and record visits
