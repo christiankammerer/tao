@@ -56,8 +56,17 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state
         )
-        self.scaler_ = StandardScaler() # Scale data for better convergence
-        self.X_ = self.scaler_.fit_transform(X)
+        
+        # Only scale for oblique splits (logistic regression needs it)
+        # Axis-aligned splits work better with raw features, especially for sparse data
+        if self.type == "oblique":
+            self.scaler_ = StandardScaler()
+            self.X_ = self.scaler_.fit_transform(X)
+        else:  # axis-aligned
+            from sklearn.preprocessing import FunctionTransformer
+            self.scaler_ = FunctionTransformer()  # Identity transform for predict()
+            self.X_ = X.copy()
+        
         self.y_ = y
         
         # Pass sample weights to sklearn tree if provided
@@ -211,21 +220,33 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         # Store old parameters to check for significant changes
         old_params = {}
         for node_id in node_ids_at_depth:
-            old_params[node_id] = (self.weights_[node_id].copy(), self.biases_[node_id])
+            if self.type == "oblique":
+                old_params[node_id] = (self.weights_[node_id].copy(), self.biases_[node_id])
+            else:  # axis-aligned
+                old_params[node_id] = (self.features_[node_id], self.thresholds_[node_id])
+
+        # Choose optimization function based on split type
+        if self.type == "oblique":
+            compute_func = self._compute_oblique_params_for_node
+        else:  # axis-aligned
+            compute_func = self._compute_axis_aligned_params_for_node
 
         # Optimize each node in parallel (does not provide significant speed-up in most cases due to overhead)
         results = Parallel(n_jobs=self.njobs)(
-            delayed(self._compute_oblique_params_for_node)(node_id)
+            delayed(compute_func)(node_id)
             for node_id in node_ids_at_depth
         )
 
-        # Apply the computed oblique parameters and track significant changes
+        # Apply the computed parameters and track significant changes
         changed_nodes = []
         for node_id, params in results:
             if params is not None:
                 # Check if parameters changed significantly
                 if self._params_changed_significantly(old_params[node_id], params, node_id):
-                    self._apply_oblique_params(node_id, params)
+                    if self.type == "oblique":
+                        self._apply_oblique_params(node_id, params)
+                    else:  # axis-aligned
+                        self._apply_axis_aligned_params(node_id, params)
                     changed_nodes.append(node_id)
         
         return changed_nodes
@@ -288,34 +309,47 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     
     def _params_changed_significantly(self, old_params, new_params, node_id):
         """
-        Check if oblique parameters changed significantly enough to warrant rerouting.
-        Uses relative change thresholds for both weights and bias to determine significance.
+        Check if parameters changed significantly enough to warrant rerouting.
+        Handles both oblique (weights, bias) and axis-aligned (feature, threshold) parameters.
         
         Args:
-            old_params: Tuple of (old_weights, old_bias)
-            new_params: Tuple of (new_weights, new_bias)
+            old_params: Tuple of old parameters (weights, bias) for oblique or (feature, threshold) for axis-aligned
+            new_params: Tuple of new parameters
             node_id: ID of the node being checked
             
         Returns:
             bool: True if parameters changed significantly
         """
-        old_w, old_b = old_params
-        new_w, new_b = new_params
+        if self.type == "oblique":
+            old_w, old_b = old_params
+            new_w, new_b = new_params
+            
+            # Handle edge case: first time setting oblique parameters
+            if np.allclose(old_w, 0) and abs(old_b) < 1e-8:
+                return True  # Always significant when going from axis-aligned to oblique
+            
+            # Relative change for weights
+            w_norm_old = np.linalg.norm(old_w)
+            w_norm_diff = np.linalg.norm(new_w.flatten() - old_w)
+            w_rel_change = w_norm_diff / (w_norm_old + 1e-8)
+            
+            # Relative change for bias
+            b_rel_change = abs(new_b[0] - old_b) / (abs(old_b) + 1e-8)
+            
+            # Consider significant if either weight or bias changed substantially
+            return w_rel_change > self.change_threshold or b_rel_change > self.change_threshold
         
-        # Handle edge case: first time setting oblique parameters
-        if np.allclose(old_w, 0) and abs(old_b) < 1e-8:
-            return True  # Always significant when going from axis-aligned to oblique
-        
-        # Relative change for weights
-        w_norm_old = np.linalg.norm(old_w)
-        w_norm_diff = np.linalg.norm(new_w.flatten() - old_w)
-        w_rel_change = w_norm_diff / (w_norm_old + 1e-8)
-        
-        # Relative change for bias
-        b_rel_change = abs(new_b[0] - old_b) / (abs(old_b) + 1e-8)
-        
-        # Consider significant if either weight or bias changed substantially
-        return w_rel_change > self.change_threshold or b_rel_change > self.change_threshold
+        else:  # axis-aligned
+            old_feature, old_threshold = old_params
+            new_feature, new_threshold = new_params
+            
+            # Feature change is always significant
+            if old_feature != new_feature:
+                return True
+            
+            # Threshold change - use relative change
+            threshold_rel_change = abs(new_threshold - old_threshold) / (abs(old_threshold) + 1e-8)
+            return threshold_rel_change > self.change_threshold
     
     def _selective_reroute(self, affected_samples):
         """
@@ -399,6 +433,78 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         # Return mask where decisions differ
         return original_goes_left != oblique_goes_left
     
+    def _compute_axis_aligned_params_for_node(self, node_id: int) -> Tuple[int, Optional[Tuple[int, float]]]:
+        """
+        Compute the optimal axis-aligned split (feature, threshold) for a given node.
+        Searches over all features and thresholds to minimize weighted misclassification on care set.
+
+        Args:
+            node_id: ID of the node to optimize
+        Returns:
+            node_id: ID of the node
+            (feature, threshold): Tuple of feature index and threshold, or None if no improvement
+        """
+        # Compute care set and targets
+        care_indices, targets = self._compute_care_set(node_id, self.node_sets_[node_id])
+
+        if len(care_indices) < 2:
+            return node_id, None
+        
+        unique_classes = np.unique(targets)
+        if len(unique_classes) < 2:
+            return node_id, None
+        
+        X_node = self.X_[care_indices]
+        
+        # Get sample weights if they exist
+        if hasattr(self, 'sample_weight_') and self.sample_weight_ is not None:
+            weights_node = self.sample_weight_[care_indices]
+            weight_sum = weights_node.sum()
+            if weight_sum > 0:
+                weights_node = weights_node / weight_sum
+            else:
+                weights_node = np.ones(len(care_indices)) / len(care_indices)
+        else:
+            weights_node = np.ones(len(care_indices)) / len(care_indices)
+        
+        best_loss = float('inf')
+        best_feature = None
+        best_threshold = None
+        
+        # Search over all features
+        for feature_idx in range(X_node.shape[1]):
+            feature_values = X_node[:, feature_idx]
+            
+            # Get unique values for potential thresholds
+            unique_values = np.unique(feature_values)
+            if len(unique_values) < 2:
+                continue
+            
+            # Try thresholds between consecutive unique values
+            thresholds = (unique_values[:-1] + unique_values[1:]) / 2
+            
+            for threshold in thresholds:
+                # Split samples based on this threshold
+                goes_left = feature_values <= threshold
+                
+                # Calculate weighted misclassification loss
+                # targets: 0 means left child is better (sample should go left)
+                #          1 means right child is better (sample should go right)
+                # So we want: goes_left == True when targets == 0
+                #             goes_left == False when targets == 1
+                correct = goes_left == (targets == 0)
+                loss = np.sum(weights_node[~correct])
+                
+                if loss < best_loss:
+                    best_loss = loss
+                    best_feature = feature_idx
+                    best_threshold = threshold
+        
+        if best_feature is None:
+            return node_id, None
+        
+        return node_id, (best_feature, best_threshold)
+
     # The two methods below handle oblique parameter computation and application
     def _compute_oblique_params_for_node(self, node_id: int) -> Tuple[int, Tuple[np.ndarray, np.ndarray]]:
         """
@@ -449,17 +555,49 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             params: Tuple of (weight vector, bias term)
         """
         w, b = params
-        self.weights_[node_id] = w
+        self.weights_[node_id] = w.flatten()
         self.biases_[node_id] = b[0]
         self.oblique_active_[node_id] = True
+    
+    def _apply_axis_aligned_params(self, node_id: int, params: Tuple[int, float]) -> None:
+        """Apply the axis-aligned parameters (feature, threshold) to the given node
+        
+        Args:
+            node_id: ID of the node to update
+            params: Tuple of (feature index, threshold)
+        """
+        feature, threshold = params
+        self.features_[node_id] = feature
+        self.thresholds_[node_id] = threshold
+        # Keep oblique_active_ as False for axis-aligned splits
 
     def prune_tree(self):
         """
         Prune the tree by removing dead branches, pure subtrees, and pass-through nodes.
         This delegates to the TreePruner class for the actual pruning logic.
+        Stores tree state before pruning for analysis.
         """
+        # Store tree structure before pruning for analysis
+        self._store_tree_before_pruning()
+        
         pruner = TreePruner(self)
         pruner.prune()
+    
+    def _store_tree_before_pruning(self):
+        """Store a copy of the tree structure before pruning."""
+        self.tree_before_pruning_ = []
+        for node_id in range(self.node_count_):
+            node_dict = {
+                'is_leaf': self.children_left_[node_id] == -1,
+                'left_child': self.children_left_[node_id],
+                'right_child': self.children_right_[node_id],
+                'feature': self.features_[node_id],
+                'threshold': self.thresholds_[node_id],
+                'n_samples': len(self.node_sets_[node_id]) if node_id < len(self.node_sets_) else 0,
+                'values': self.values_[node_id].copy(),
+                'samples_per_class': self.values_[node_id, 0, :].copy()
+            }
+            self.tree_before_pruning_.append(node_dict)
     
     def _update_traverser(self):
         """
