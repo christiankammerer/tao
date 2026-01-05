@@ -11,7 +11,7 @@ from joblib import Parallel, delayed
 class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     def __init__(self, max_depth=5, min_samples_leaf=5, random_state=None,
                  type = "oblique", max_passes=5, C=1, reroute_every: int = 1, njobs: int = 1, niter = 100,
-                 change_threshold=0.01, selective_reroute=True):
+                 change_threshold=0.01, selective_reroute=True, early_stopping=True):
         """
         Initialize TAO Tree Classifier.
         Args:
@@ -25,7 +25,8 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
             njobs: Number of parallel jobs to use for optimizing nodes at the same depth (parallelism overhead may outweigh benefits)
             niter: Number of iterations for logistic regression solver (some logreg solvers may not converge well with few iterations)
             change_threshold: Relative change threshold to determine if rerouting is needed
-            selective_reroute: Whether to selectively reroute only changed nodes or all nodes at a depth    
+            selective_reroute: Whether to selectively reroute only changed nodes or all nodes at a depth
+            early_stopping: Whether to stop optimization early if no nodes change in a complete pass
         """
         if reroute_every < 1:
             raise ValueError("reroute_every must be >= 1")
@@ -42,6 +43,7 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
         self.niter = niter
         self.change_threshold = change_threshold
         self.selective_reroute = selective_reroute
+        self.early_stopping = early_stopping
     
     # The two methods below initialize the base decision tree and extract its structure
     def _init_base_tree(self, X, y):
@@ -174,10 +176,18 @@ class TAOTreeClassifier(BaseEstimator, ClassifierMixin):
     
     def _optimize_tree(self):
         for pass_num in range(self.max_passes):
+            pass_had_changes = False  # Track if any nodes changed in this pass
+            
             for depth_batch in self.get_depth_batch(self.node_depth_, self.reroute_every):
                 changed_nodes = self._optimize_depth(depth_batch)
-                if changed_nodes and np.any(depth_batch > 0):
-                    self.reroute(changed_nodes)
+                if changed_nodes:
+                    pass_had_changes = True
+                    if np.any(depth_batch > 0):
+                        self.reroute(changed_nodes)
+            
+            # Early stopping if converged
+            if self.early_stopping and not pass_had_changes:
+                break
 
 
     # The two methods below handle depth batching and optimization at a given depth
