@@ -22,8 +22,8 @@ After changing the nodes in a layer, the samples in the tree get re-routed to wh
 
  ## Important notes
  - Nodes on the same depth-level are independent of each other, and thus can be optimized in parallel. In practice, the parallelization overhead typically exceeds the performance gain, thus use at your own discretion.
- - This implementation only implements TAO for classification, although in theory this could be extended to regression tasks as well. 
-   
+ - This implementation only implements TAO for classification, although in theory this could be extended to regression tasks as well.
+ - Datasets are redistributed for research purposes; original sources are cited in the accompanying paper.
 ## Code Demonstration
 ```
 from sklearn.datasets import load_breast_cancer
@@ -64,3 +64,4 @@ print(f"Test accuracy TAO: {accuracy_tao:.4f}")
 ```
 Test accuracy Decision Tree: 0.9532<br>
 Test accuracy TAO: 0.9825
+
